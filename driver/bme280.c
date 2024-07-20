@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <asm/div64.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("leungjch");
@@ -37,9 +38,20 @@ dev_t dev_num = 0;
 static struct class *dev_class;
 static struct cdev bme280_cdev;
 
+#define IOCTL_GET_TEMPERATURE _IOR('t', 1, long int)
+#define IOCTL_GET_HUMIDITY    _IOR('h', 2, long int)
+#define IOCTL_GET_PRESSURE    _IOR('p', 3, long int)
+
 static int bme280_open(struct inode *device_file, struct file *instance);
 static int bme280_close(struct inode *device_file, struct file *instance);
 static ssize_t bme280_read(struct file *fptr, char __user *buf, size_t len, loff_t *off);
+
+void read_calibration(void);
+long signed int read_temperature(void);
+long unsigned int read_pressure_int64(void);
+long signed int read_humidity(void);
+
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 #define CONCAT_BYTES(msb, lsb) (((uint16_t)msb << 8) | (uint16_t)lsb)
 
@@ -196,7 +208,7 @@ void read_calibration(void)
   dig_P9 = CONCAT_BYTES(reg_data1[23], reg_data1[22]);
 
   // read calibration humidity registers
-  dig_H1 = reg_data1[24];
+  dig_H1 = i2c_smbus_read_byte_data(bme280_i2c_client, 0xA1);
   dig_H2 = CONCAT_BYTES(reg_data2[1], reg_data2[0]);
   dig_H3 = reg_data2[2];
 
@@ -214,7 +226,9 @@ static struct file_operations fops = {
     .owner = THIS_MODULE,
     .open = bme280_open,
     .release = bme280_close,
-    .read = bme280_read};
+    .read = bme280_read,
+    .unlocked_ioctl = device_ioctl
+};
 
 static int bme280_open(struct inode *device_file, struct file *instance)
 {
@@ -266,6 +280,36 @@ static ssize_t bme280_read(struct file *fptr, char __user *buf, size_t len, loff
   return 0;
 }
 
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+  long int value;
+
+  read_calibration();
+
+  switch (cmd) {
+    case IOCTL_GET_TEMPERATURE:
+      value = read_temperature();
+      if (copy_to_user((long int __user *)arg, &value, sizeof(value))) {
+        return -EFAULT;
+      }
+      break;
+    case IOCTL_GET_HUMIDITY:
+      value = read_humidity();
+      if (copy_to_user((long int __user *)arg, &value, sizeof(value))) {
+        return -EFAULT;
+      }
+      break;
+    case IOCTL_GET_PRESSURE:
+      value = read_pressure_int64();
+      if (copy_to_user((long int __user *)arg, &value, sizeof(value))) {
+        return -EFAULT;
+      }
+      break;
+    default:
+      return -EINVAL;
+  }
+  return 0;
+}
+
 static int init_driver(void)
 {
   int ret = -1;
@@ -280,7 +324,11 @@ static int init_driver(void)
   }
 
   // Create class
+  #if LINUX_VERSION_CODE <= KERNEL_VERSION(6,3,0)
   dev_class = class_create(THIS_MODULE, DEV_CLASS);
+  #else
+  dev_class = class_create(DEV_CLASS);
+  #endif
   if (IS_ERR(dev_class))
   {
     pr_err("bme280: failed to create class\n");
@@ -329,11 +377,17 @@ static int init_driver(void)
   // read id, which is always 0x60 for bme280
   id = i2c_smbus_read_byte_data(bme280_i2c_client, 0xD0);
 
+  if (id != 0x60)
+  {
+    pr_err("bme280: id is not 0x60\n");
+    goto I2CError;
+  }
+
   pr_info("id is 0x%x\n", id);
 
-  // set config register at 0xF5
-  // set t_standby time
-  i2c_smbus_write_byte_data(bme280_i2c_client, 0xf5, 0x3 << 5);
+
+  // set ctrl_hum (humidity oversampling)
+  i2c_smbus_write_byte_data(bme280_i2c_client, 0xf2, (0x3 << 0));
 
   // set ctrl_meas register at 0xF4
   // set temperature oversampling to max (b101)
@@ -341,8 +395,9 @@ static int init_driver(void)
   // set normal mode (b11)
   i2c_smbus_write_byte_data(bme280_i2c_client, 0xf4, (0x5 << 5) | (0x5 << 2) | (0x3 << 0));
 
-  // set ctrl_hum (humidity oversampling)
-  i2c_smbus_write_byte_data(bme280_i2c_client, 0xf2, (0x3 << 0));
+  // set config register at 0xF5
+  // set t_standby time
+  i2c_smbus_write_byte_data(bme280_i2c_client, 0xf5, 0x3 << 5);
 
   // set the calibration registers
   read_calibration();
@@ -350,6 +405,10 @@ static int init_driver(void)
   pr_info("bme280: successfully init module\n");
 
   return ret;
+I2CError:
+  i2c_unregister_device(bme280_i2c_client);
+  i2c_del_driver(&bme280_i2c_driver);
+  cdev_del(&bme280_cdev);
 KernelError:
   device_destroy(dev_class, dev_num);
 DeviceError:
